@@ -1,0 +1,6 @@
+{
+  "name": "联机光标战机",
+  "description": "经典双人联机光标战机空战，实时 WebSocket 同步，支持触控拖拽与键盘操控。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
