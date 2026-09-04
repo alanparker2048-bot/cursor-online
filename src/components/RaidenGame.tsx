@@ -769,12 +769,12 @@ export default function RaidenGame() {
   }, []);
 
   return (
-    <div id="game-main-container" className="flex flex-col lg:flex-row items-center justify-center min-h-screen bg-neutral-950 p-2 sm:p-4 text-white font-mono select-none overflow-hidden">
-      {/* 核心游戏视口（固定 9:16 黄金手机纵向比例，精致电竞外框） */}
-      <div className="relative flex flex-col items-center">
+    <div id="game-main-container" className="flex flex-col lg:flex-row items-center justify-center h-[100dvh] min-h-[100svh] max-h-[100dvh] bg-neutral-950 p-1.5 sm:p-4 pb-[max(0.5rem,env(safe-area-inset-bottom))] text-white font-mono select-none overflow-hidden box-border">
+      {/* 核心游戏视口（固定 9:16 黄金手机纵向比例，精准适配 100svh/100dvh 视口高度） */}
+      <div className="relative flex flex-col items-center justify-center max-h-full h-full">
         <div
           id="gameWrapper"
-          className="relative w-full aspect-[9/16] max-w-[390px] max-h-[85vh] bg-[#020205] rounded-2xl overflow-hidden shadow-[0_0_40px_rgba(0,229,255,0.2)] border border-cyan-900/60"
+          className="relative w-full aspect-[9/16] max-w-[390px] max-h-[calc(100svh-54px)] sm:max-h-[82vh] bg-[#020205] rounded-2xl overflow-hidden shadow-[0_0_40px_rgba(0,229,255,0.2)] border border-cyan-900/60 flex-shrink"
         >
           {/* 画布 */}
           <canvas
@@ -821,9 +821,9 @@ export default function RaidenGame() {
           {(!inGame || gameOver) && (
             <div
               id="overlay"
-              className="absolute inset-0 bg-[#04050f]/95 backdrop-blur-sm flex flex-col items-center justify-center p-6 text-center z-20"
+              className="absolute inset-0 bg-[#04050f]/95 backdrop-blur-sm flex flex-col items-center justify-center p-4 sm:p-6 text-center z-20 overflow-y-auto"
             >
-              <h1 id="overlayTitle" className="text-2xl sm:text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 via-sky-200 to-amber-400 tracking-wider drop-shadow-[0_0_15px_rgba(0,229,255,0.5)] mb-6">
+              <h1 id="overlayTitle" className="text-xl sm:text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 via-sky-200 to-amber-400 tracking-wider drop-shadow-[0_0_15px_rgba(0,229,255,0.5)] mb-3 sm:mb-6">
                 {gameOver ? '战机全军覆没' : '联机光标战机'}
               </h1>
 
@@ -896,7 +896,7 @@ export default function RaidenGame() {
         </div>
 
         {/* 屏幕下方快速操作栏 */}
-        <div className="mt-3 flex items-center justify-between w-full max-w-[390px] px-2 text-xs text-zinc-400">
+        <div className="mt-2 flex items-center justify-between w-full max-w-[390px] px-2 text-xs text-zinc-400 shrink-0">
           <div className="flex items-center gap-2">
             <button
               onClick={toggleMute}
