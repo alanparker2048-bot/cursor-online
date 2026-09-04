@@ -1,7 +1,7 @@
 // Web Audio API 8-bit / Arcade 声音合成器
 class SoundEngine {
   private ctx: AudioContext | null = null;
-  private isMuted: boolean = false;
+  private isMuted: boolean = true;
 
   private init() {
     if (!this.ctx && typeof window !== 'undefined') {

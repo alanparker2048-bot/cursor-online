@@ -27,13 +27,13 @@ export default function RaidenGame() {
   const [roomId, setRoomId] = useState(() => {
     if (typeof window !== 'undefined') {
       const params = new URLSearchParams(window.location.search);
-      return params.get('room') || '888';
+      return params.get('room') || '';
     }
-    return '888';
+    return '';
   });
   const [statusMsg, setStatusMsg] = useState('输入房间号加入或创建对局');
   const [isConnecting, setIsConnecting] = useState(false);
-  const [isMuted, setIsMuted] = useState(false);
+  const [isMuted, setIsMuted] = useState(true);
   const [fps, setFps] = useState(60);
 
   // 引用变量存储游戏实时物理状态，避免频繁 re-render
@@ -620,6 +620,9 @@ export default function RaidenGame() {
             setRole(data.role);
             roleRef.current = data.role;
             setGameMode('online');
+            if (data.roomId) {
+              setRoomId(data.roomId);
+            }
             if (data.role === 'p1') {
               setStatusMsg(`房间 ${data.roomId} 创建成功！你是【P1 房主(蓝)】，等待战友加入...`);
             } else {
@@ -772,6 +775,31 @@ export default function RaidenGame() {
     <div id="game-main-container" className="flex flex-col lg:flex-row items-center justify-center h-[100dvh] min-h-[100svh] max-h-[100dvh] bg-neutral-950 p-1.5 sm:p-4 pb-[max(0.5rem,env(safe-area-inset-bottom))] text-white font-mono select-none overflow-hidden box-border">
       {/* 核心游戏视口（固定 9:16 黄金手机纵向比例，精准适配 100svh/100dvh 视口高度） */}
       <div className="relative flex flex-col items-center justify-center max-h-full h-full">
+        {/* 顶部快捷控制与操作说明提示栏 (音效与操作提示) */}
+        <div className="mb-2 flex items-center justify-between w-full max-w-[390px] px-2 text-xs text-zinc-400 shrink-0">
+          <div className="flex items-center gap-2">
+            <button
+              id="soundToggleBtn"
+              onClick={toggleMute}
+              className="p-2 rounded-lg bg-zinc-900/80 border border-zinc-800 hover:text-white transition flex items-center gap-1 text-xs"
+              title={isMuted ? '开启音效' : '静音'}
+            >
+              {isMuted ? <VolumeX className="w-4 h-4 text-red-400" /> : <Volume2 className="w-4 h-4 text-cyan-400" />}
+              <span>{isMuted ? '静音' : '音效开'}</span>
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2 text-[11px] text-zinc-500">
+            <span className="flex items-center gap-1">
+              <Smartphone className="w-3.5 h-3.5 text-zinc-400" /> 触控
+            </span>
+            <span>•</span>
+            <span className="flex items-center gap-1">
+              <Monitor className="w-3.5 h-3.5 text-zinc-400" /> WASD/方向键
+            </span>
+          </div>
+        </div>
+
         <div
           id="gameWrapper"
           className="relative w-full aspect-[9/16] max-w-[390px] max-h-[calc(100svh-54px)] sm:max-h-[82vh] bg-[#020205] rounded-2xl overflow-hidden shadow-[0_0_40px_rgba(0,229,255,0.2)] border border-cyan-900/60 flex-shrink"
@@ -811,7 +839,7 @@ export default function RaidenGame() {
           {inGame && (
             <div className="absolute bottom-2 left-3 right-3 flex justify-between items-center pointer-events-none text-[10px] text-zinc-500">
               <span className="bg-black/50 px-2 py-0.5 rounded border border-zinc-800">
-                {gameMode === 'practice' ? '单人单机演习' : `房间 ${roomId} · 协同作战`}
+                {gameMode === 'practice' ? '单人单机演习' : `房间 ${roomId || '888'} · 协同作战`}
               </span>
               <span className="bg-black/50 px-2 py-0.5 rounded border border-zinc-800">FPS: {fps}</span>
             </div>
@@ -841,9 +869,8 @@ export default function RaidenGame() {
               {/* 房间配置表单 */}
               <div className="w-full max-w-[280px] space-y-3 mb-4 text-left">
                 <div>
-                  <div className="flex justify-between items-center mb-1">
+                  <div className="mb-1">
                     <label className="text-[11px] text-zinc-400">房间号</label>
-                    <span className="text-[10px] text-cyan-500">相同房间号自动配对</span>
                   </div>
                   <input
                     id="roomId"
@@ -851,7 +878,7 @@ export default function RaidenGame() {
                     value={roomId}
                     onChange={(e) => setRoomId(e.target.value)}
                     placeholder="输入房间号 如 888"
-                    className="w-full px-3 py-2 bg-zinc-900/90 border border-cyan-500/30 rounded-lg text-sm text-cyan-300 focus:outline-none focus:border-cyan-400 font-bold"
+                    className="w-full px-3 py-2.5 bg-zinc-900/90 border border-cyan-500/30 rounded-lg text-sm text-cyan-300 placeholder:text-[#4a8b8b] placeholder:font-bold focus:outline-none focus:border-cyan-400 font-bold"
                   />
                 </div>
               </div>
@@ -893,30 +920,6 @@ export default function RaidenGame() {
               </div>
             </div>
           )}
-        </div>
-
-        {/* 屏幕下方快速操作栏 */}
-        <div className="mt-2 flex items-center justify-between w-full max-w-[390px] px-2 text-xs text-zinc-400 shrink-0">
-          <div className="flex items-center gap-2">
-            <button
-              onClick={toggleMute}
-              className="p-2 rounded-lg bg-zinc-900/80 border border-zinc-800 hover:text-white transition flex items-center gap-1 text-xs"
-              title={isMuted ? '开启音效' : '静音'}
-            >
-              {isMuted ? <VolumeX className="w-4 h-4 text-red-400" /> : <Volume2 className="w-4 h-4 text-cyan-400" />}
-              <span>{isMuted ? '静音' : '音效开'}</span>
-            </button>
-          </div>
-
-          <div className="flex items-center gap-2 text-[11px] text-zinc-500">
-            <span className="flex items-center gap-1">
-              <Smartphone className="w-3.5 h-3.5 text-zinc-400" /> 触控
-            </span>
-            <span>•</span>
-            <span className="flex items-center gap-1">
-              <Monitor className="w-3.5 h-3.5 text-zinc-400" /> WASD/方向键
-            </span>
-          </div>
         </div>
       </div>
 
