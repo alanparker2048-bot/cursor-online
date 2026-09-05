@@ -35,7 +35,7 @@ wss.on('connection', (ws: WebSocket) => {
 
       if (data.type === 'ping') {
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'pong' }));
+          ws.send(JSON.stringify({ type: 'pong', t: data.t }));
         }
         return;
       }

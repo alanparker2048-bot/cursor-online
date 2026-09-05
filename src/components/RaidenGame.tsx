@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { Volume2, VolumeX, Play, Users, RefreshCw, Smartphone, Monitor } from 'lucide-react';
+import { Volume2, VolumeX, Play, Users, RefreshCw, Wifi, Activity } from 'lucide-react';
 import { Role, PlayerState, Bullet, Enemy, Particle, Star, WSMessage, GameMode } from '../types';
 import { sounds } from '../utils/audio';
 
@@ -35,6 +35,7 @@ export default function RaidenGame() {
   const [isConnecting, setIsConnecting] = useState(false);
   const [isMuted, setIsMuted] = useState(true);
   const [fps, setFps] = useState(60);
+  const [ping, setPing] = useState<number | null>(null);
 
   // 引用变量存储游戏实时物理状态，避免频繁 re-render
   const wsRef = useRef<WebSocket | null>(null);
@@ -44,37 +45,36 @@ export default function RaidenGame() {
   const p1KillsRef = useRef(0);
   const p2KillsRef = useRef(0);
   const keysRef = useRef<{ [key: string]: boolean }>({});
+  const pingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const p1Ref = useRef<PlayerState>({ x: 120, y: 550, hp: 3, alive: true, color: '#00e5ff', stroke: '#80deea' });
   const p2Ref = useRef<PlayerState>({ x: 255, y: 550, hp: 3, alive: true, color: '#ff9100', stroke: '#ffe082' });
 
-  // 方案1：远程战机平滑插值 (LERP) 状态
-  interface PeerInterpolationState {
-    targetX: number;
-    targetY: number;
+  // 工业级状态切片插值 (Time-sliced Snapshot Interpolation) 环形缓冲区结构
+  interface StateSnapshot {
+    x: number;
+    y: number;
     vx: number;
     vy: number;
+    t: number; // 本地接收时刻 performance.now()
+  }
+  interface PeerBufferState {
+    snapshots: StateSnapshot[];
     initialized: boolean;
     lastPacketTime: number;
   }
-  const p1TargetRef = useRef<PeerInterpolationState>({
-    targetX: 120,
-    targetY: 550,
-    vx: 0,
-    vy: 0,
+  const p1BufferRef = useRef<PeerBufferState>({
+    snapshots: [],
     initialized: false,
     lastPacketTime: 0,
   });
-  const p2TargetRef = useRef<PeerInterpolationState>({
-    targetX: 255,
-    targetY: 550,
-    vx: 0,
-    vy: 0,
+  const p2BufferRef = useRef<PeerBufferState>({
+    snapshots: [],
     initialized: false,
     lastPacketTime: 0,
   });
 
-  // 方案3：网络数据包 30Hz 节流发送 (约 33ms 一次，减少网络拥塞，告别数据包粘连)
+  // 网络数据包 30Hz 节流发送 (约 33ms 一次，减少网络拥塞)
   const lastPosSendTimeRef = useRef(0);
   const lastSentPosRef = useRef({ x: 0, y: 0 });
   const pendingPosSendRef = useRef(false);
@@ -153,6 +153,7 @@ export default function RaidenGame() {
           y: Math.round(me.y * 10) / 10,
           vx: force ? 0 : vx,
           vy: force ? 0 : vy,
+          t: Math.round(now),
         });
 
         lastPosSendTimeRef.current = now;
@@ -283,33 +284,69 @@ export default function RaidenGame() {
         broadcastMyPosition(false);
       }
 
-      // 方案1：对方战机平滑插值 (LERP) 更新，彻底消除网络抖动闪现与画面僵死停顿
+      // 方案1升级：工业级时间切片插值引擎 (Time-sliced Snapshot Interpolation with 60ms Buffer)
+      // 类似 CS/PUBG/球球大作战核心网络模型，彻底吸收 TCP 抖动，视觉极其丝滑
       const peerRole: Role = currentRole === 'p2' ? 'p1' : 'p2';
       const peer = peerRole === 'p1' ? p1 : p2;
-      const peerTarget = peerRole === 'p1' ? p1TargetRef.current : p2TargetRef.current;
+      const peerBuffer = peerRole === 'p1' ? p1BufferRef.current : p2BufferRef.current;
 
-      if (gameMode === 'online' && peerTarget.initialized && peer.alive) {
-        // 微量航位推测：如果对方正处于运动中，在两包到达间隔进行短时微推（上限 80ms，杜绝过冲）
-        const timeSincePacket = performance.now() - peerTarget.lastPacketTime;
-        let targetX = peerTarget.targetX;
-        let targetY = peerTarget.targetY;
-        if (timeSincePacket < 80 && (peerTarget.vx !== 0 || peerTarget.vy !== 0)) {
-          targetX += (peerTarget.vx * (dt / 1000));
-          targetY += (peerTarget.vy * (dt / 1000));
-          targetX = Math.max(16, Math.min(V_W - 16, targetX));
-          targetY = Math.max(20, Math.min(V_H - 20, targetY));
-        }
+      if (gameMode === 'online' && peerBuffer.initialized && peer.alive) {
+        const snaps = peerBuffer.snapshots;
+        const now = performance.now();
+        // 60ms 插值缓冲窗口 (约 3~4 帧，完美平抑任何网络抖动与 TCP 延迟波动)
+        const INTERPOLATION_DELAY = 60;
+        const renderTime = now - INTERPOLATION_DELAY;
 
-        const dist = Math.hypot(targetX - peer.x, targetY - peer.y);
-        if (dist > 160) {
-          // 距离过大（如开局或复活重置），直接对齐
-          peer.x = targetX;
-          peer.y = targetY;
-        } else if (dist > 0.1) {
-          // 指数平滑衰减插值 (LERP)：帧率自适应，每 16ms 趋近约 30%，相当于超平滑的视觉过渡
-          const lerpFactor = 1 - Math.exp(-22 * (dt / 1000));
-          peer.x += (targetX - peer.x) * lerpFactor;
-          peer.y += (targetY - peer.y) * lerpFactor;
+        if (snaps.length === 1) {
+          peer.x = snaps[0].x;
+          peer.y = snaps[0].y;
+        } else if (snaps.length > 1) {
+          const oldest = snaps[0];
+          const latest = snaps[snaps.length - 1];
+
+          if (renderTime <= oldest.t) {
+            peer.x = oldest.x;
+            peer.y = oldest.y;
+          } else if (renderTime >= latest.t) {
+            // 弱网或网络包迟到：启动 Dead Reckoning (航位推测) 平滑外推，限制在 120ms 内
+            const extraTime = Math.min(0.12, (renderTime - latest.t) / 1000);
+            const targetX = Math.max(16, Math.min(V_W - 16, latest.x + latest.vx * extraTime));
+            const targetY = Math.max(20, Math.min(V_H - 20, latest.y + latest.vy * extraTime));
+            const extrapolateFactor = 1 - Math.exp(-24 * (dt / 1000));
+            peer.x += (targetX - peer.x) * extrapolateFactor;
+            peer.y += (targetY - peer.y) * extrapolateFactor;
+          } else {
+            // 黄金插值区间：找到恰好覆盖 renderTime 的前后两个时间切片 S0 和 S1
+            let s0 = oldest;
+            let s1 = latest;
+            for (let i = 0; i < snaps.length - 1; i++) {
+              if (snaps[i].t <= renderTime && snaps[i + 1].t >= renderTime) {
+                s0 = snaps[i];
+                s1 = snaps[i + 1];
+                break;
+              }
+            }
+
+            const duration = s1.t - s0.t;
+            if (duration > 0) {
+              const ratio = Math.max(0, Math.min(1, (renderTime - s0.t) / duration));
+              // 三次 Smoothstep 消除折角与生硬转折: 3*r^2 - 2*r^3
+              const smoothRatio = ratio * ratio * (3 - 2 * ratio);
+              const targetX = s0.x + (s1.x - s0.x) * smoothRatio;
+              const targetY = s0.y + (s1.y - s0.y) * smoothRatio;
+
+              if (Math.hypot(targetX - peer.x, targetY - peer.y) > 160) {
+                peer.x = targetX;
+                peer.y = targetY;
+              } else {
+                peer.x = targetX;
+                peer.y = targetY;
+              }
+            } else {
+              peer.x = s1.x;
+              peer.y = s1.y;
+            }
+          }
         }
       }
 
@@ -669,8 +706,17 @@ export default function RaidenGame() {
     p2Ref.current = { x: 255, y: 550, hp: 3, alive: true, color: '#ff9100', stroke: '#ffe082' };
 
     // 重置双人插值与发包状态
-    p1TargetRef.current = { targetX: 120, targetY: 550, vx: 0, vy: 0, initialized: false, lastPacketTime: 0 };
-    p2TargetRef.current = { targetX: 255, targetY: 550, vx: 0, vy: 0, initialized: false, lastPacketTime: 0 };
+    const initNow = performance.now();
+    p1BufferRef.current = {
+      snapshots: [{ x: 120, y: 550, vx: 0, vy: 0, t: initNow }],
+      initialized: false,
+      lastPacketTime: 0,
+    };
+    p2BufferRef.current = {
+      snapshots: [{ x: 255, y: 550, vx: 0, vy: 0, t: initNow }],
+      initialized: false,
+      lastPacketTime: 0,
+    };
     lastPosSendTimeRef.current = 0;
     const curRole = roleRef.current;
     lastSentPosRef.current = { x: curRole === 'p2' ? 255 : 120, y: 550 };
@@ -715,6 +761,11 @@ export default function RaidenGame() {
     if (wsRef.current) {
       wsRef.current.close();
     }
+    if (pingIntervalRef.current) {
+      clearInterval(pingIntervalRef.current);
+      pingIntervalRef.current = null;
+    }
+    setPing(null);
 
     const wsUrl = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + host;
     try {
@@ -724,6 +775,14 @@ export default function RaidenGame() {
       socket.onopen = () => {
         setStatusMsg('已建立连接，正在进入房间 ' + rId + '...');
         socket.send(JSON.stringify({ type: 'join', roomId: rId }));
+        // 连通立即首测一次延迟
+        socket.send(JSON.stringify({ type: 'ping', t: performance.now() }));
+        // 开启 1.5 秒心跳实时测速
+        pingIntervalRef.current = setInterval(() => {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: 'ping', t: performance.now() }));
+          }
+        }, 1500);
       };
 
       socket.onmessage = (event) => {
@@ -746,25 +805,46 @@ export default function RaidenGame() {
             setIsConnecting(false);
             setTimeout(startBattle, 800);
           } else if (data.type === 'pos') {
-            // 方案1：接收端平滑插值 (LERP) 处理
+            // 工业级状态切片插值 (Time-sliced Snapshot Interpolation) 接收端
             const isP1 = data.role === 'p1';
-            const target = isP1 ? p1TargetRef.current : p2TargetRef.current;
+            const peerBuffer = isP1 ? p1BufferRef.current : p2BufferRef.current;
             const fighter = isP1 ? p1Ref.current : p2Ref.current;
+            const now = performance.now();
+            const newSnap: StateSnapshot = {
+              x: data.x,
+              y: data.y,
+              vx: data.vx || 0,
+              vy: data.vy || 0,
+              t: now,
+            };
 
-            if (!target.initialized) {
-              // 首次收到数据包，立即瞬移对齐坐标，防止从出生点长距离滑行
+            if (!peerBuffer.initialized) {
               fighter.x = data.x;
               fighter.y = data.y;
-              target.targetX = data.x;
-              target.targetY = data.y;
-              target.initialized = true;
+              peerBuffer.snapshots = [newSnap];
+              peerBuffer.initialized = true;
+              peerBuffer.lastPacketTime = now;
             } else {
-              target.targetX = data.x;
-              target.targetY = data.y;
+              const lastSnap = peerBuffer.snapshots[peerBuffer.snapshots.length - 1];
+              if (lastSnap && Math.hypot(data.x - lastSnap.x, data.y - lastSnap.y) > 160) {
+                // 异常位移（如重生），清空快照瞬移对齐
+                fighter.x = data.x;
+                fighter.y = data.y;
+                peerBuffer.snapshots = [newSnap];
+              } else {
+                peerBuffer.snapshots.push(newSnap);
+                if (peerBuffer.snapshots.length > 12) {
+                  peerBuffer.snapshots.shift();
+                }
+              }
+              peerBuffer.lastPacketTime = now;
             }
-            target.vx = data.vx || 0;
-            target.vy = data.vy || 0;
-            target.lastPacketTime = performance.now();
+          } else if (data.type === 'pong') {
+            if (typeof data.t === 'number') {
+              const measured = Math.max(1, Math.round(performance.now() - data.t));
+              // 平滑滤波，避免单次突刺导致数字频繁剧烈跳变
+              setPing((prev) => (prev === null ? measured : Math.round(prev * 0.6 + measured * 0.4)));
+            }
           } else if (data.type === 'sync_enemies') {
             // P2 平滑同步存活敌机列表
             if (roleRef.current === 'p2') {
@@ -844,10 +924,20 @@ export default function RaidenGame() {
       socket.onerror = () => {
         setStatusMsg('网络连接中断，请确认服务器正常运行');
         setIsConnecting(false);
+        if (pingIntervalRef.current) {
+          clearInterval(pingIntervalRef.current);
+          pingIntervalRef.current = null;
+        }
+        setPing(null);
       };
 
       socket.onclose = () => {
         setIsConnecting(false);
+        if (pingIntervalRef.current) {
+          clearInterval(pingIntervalRef.current);
+          pingIntervalRef.current = null;
+        }
+        setPing(null);
         if (gameRunningRef.current) {
           setStatusMsg('连接已断开，请重连');
           gameRunningRef.current = false;
@@ -904,6 +994,10 @@ export default function RaidenGame() {
     return () => {
       gameRunningRef.current = false;
       if (animIdRef.current) cancelAnimationFrame(animIdRef.current);
+      if (pingIntervalRef.current) {
+        clearInterval(pingIntervalRef.current);
+        pingIntervalRef.current = null;
+      }
       if (wsRef.current) wsRef.current.close();
     };
   }, []);
@@ -926,14 +1020,43 @@ export default function RaidenGame() {
             </button>
           </div>
 
-          <div className="flex items-center gap-2 text-[11px] text-zinc-500">
-            <span className="flex items-center gap-1">
-              <Smartphone className="w-3.5 h-3.5 text-zinc-400" /> 触控
-            </span>
-            <span>•</span>
-            <span className="flex items-center gap-1">
-              <Monitor className="w-3.5 h-3.5 text-zinc-400" /> WASD/方向键
-            </span>
+          {/* 右上角网络延迟 (Ping) 实时仪表盘 */}
+          <div id="network-ping-badge" className="flex items-center text-xs">
+            {gameMode === 'practice' ? (
+              <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-zinc-900/80 border border-zinc-800 text-zinc-400">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]" />
+                <span className="text-[11px] font-bold text-zinc-300">单机 0ms</span>
+              </div>
+            ) : (
+              <div
+                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-zinc-900/90 border transition-all ${
+                  ping === null
+                    ? 'border-zinc-800 text-zinc-500'
+                    : ping < 60
+                    ? 'border-emerald-500/40 text-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.15)]'
+                    : ping < 120
+                    ? 'border-amber-500/40 text-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.15)]'
+                    : 'border-red-500/50 text-red-400 shadow-[0_0_8px_rgba(248,113,113,0.2)]'
+                }`}
+                title="网络往返延迟 (Ping)"
+              >
+                <span
+                  className={`w-2 h-2 rounded-full ${
+                    ping === null
+                      ? 'bg-zinc-600 animate-pulse'
+                      : ping < 60
+                      ? 'bg-emerald-400 shadow-[0_0_6px_#34d399]'
+                      : ping < 120
+                      ? 'bg-amber-400 shadow-[0_0_6px_#fbbf24]'
+                      : 'bg-red-400 animate-ping'
+                  }`}
+                />
+                <Wifi className="w-3.5 h-3.5" />
+                <span className="text-[11px] font-bold tracking-tight">
+                  {ping === null ? (isConnecting ? '连接中...' : '未连线') : `Ping ${ping}ms`}
+                </span>
+              </div>
+            )}
           </div>
         </div>
 
@@ -978,7 +1101,13 @@ export default function RaidenGame() {
               <span className="bg-black/50 px-2 py-0.5 rounded border border-zinc-800">
                 {gameMode === 'practice' ? '单人单机演习' : `房间 ${roomId || '888'} · 协同作战`}
               </span>
-              <span className="bg-black/50 px-2 py-0.5 rounded border border-zinc-800">FPS: {fps}</span>
+              <span className="bg-black/50 px-2 py-0.5 rounded border border-zinc-800 flex items-center gap-1.5">
+                <span>FPS: {fps}</span>
+                <span className="text-zinc-600">|</span>
+                <span className={ping !== null && ping < 60 ? 'text-emerald-400 font-bold' : ping !== null && ping < 120 ? 'text-amber-400 font-bold' : 'text-zinc-400'}>
+                  {gameMode === 'practice' ? '0ms' : ping !== null ? `${ping}ms` : '--'}
+                </span>
+              </span>
             </div>
           )}
 
