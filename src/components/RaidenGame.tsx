@@ -527,7 +527,7 @@ export default function RaidenGame() {
 
       animIdRef.current = requestAnimationFrame(updateAndRender);
     },
-    [createBullet, createEnemy, createExplosion, addFloatingText, gameMode, sendMsg, checkGameOverCondition]
+    [createBullet, createEnemy, createExplosion, addFloatingText, gameMode, sendMsg, checkGameOverCondition, broadcastMyPosition]
   );
 
   // 战机机体绘制
@@ -611,13 +611,14 @@ export default function RaidenGame() {
     me.x = Math.max(16, Math.min(V_W - 16, pos.x + touchOffsetRef.current.x));
     me.y = Math.max(20, Math.min(V_H - 20, pos.y + touchOffsetRef.current.y));
 
-    if (currentRole) {
-      sendMsg({ type: 'pos', role: currentRole, x: me.x, y: me.y });
-    }
+    // 方案3：智能 30Hz 限流广播，防止高刷屏/高频 Touch 疯狂发包导致网络信道拥堵
+    broadcastMyPosition(false);
   };
 
   const onPointerUp = () => {
     touchActiveRef.current = false;
+    // 手指松开时强制发送一次静止坐标与零速度，确保对方精准停位
+    broadcastMyPosition(true);
   };
 
   // 启动对局
@@ -633,6 +634,14 @@ export default function RaidenGame() {
 
     p1Ref.current = { x: 120, y: 550, hp: 3, alive: true, color: '#00e5ff', stroke: '#80deea' };
     p2Ref.current = { x: 255, y: 550, hp: 3, alive: true, color: '#ff9100', stroke: '#ffe082' };
+
+    // 重置双人插值与发包状态
+    p1TargetRef.current = { targetX: 120, targetY: 550, vx: 0, vy: 0, initialized: false, lastPacketTime: 0 };
+    p2TargetRef.current = { targetX: 255, targetY: 550, vx: 0, vy: 0, initialized: false, lastPacketTime: 0 };
+    lastPosSendTimeRef.current = 0;
+    lastSentPosRef.current = { x: 0, y: 0 };
+    pendingPosSendRef.current = false;
+
     setP1Hp(3);
     setP2Hp(3);
     setP1Alive(true);
@@ -703,13 +712,25 @@ export default function RaidenGame() {
             setIsConnecting(false);
             setTimeout(startBattle, 800);
           } else if (data.type === 'pos') {
-            if (data.role === 'p1') {
-              p1Ref.current.x = data.x;
-              p1Ref.current.y = data.y;
-            } else if (data.role === 'p2') {
-              p2Ref.current.x = data.x;
-              p2Ref.current.y = data.y;
+            // 方案1：接收端平滑插值 (LERP) 处理
+            const isP1 = data.role === 'p1';
+            const target = isP1 ? p1TargetRef.current : p2TargetRef.current;
+            const fighter = isP1 ? p1Ref.current : p2Ref.current;
+
+            if (!target.initialized) {
+              // 首次收到数据包，立即瞬移对齐坐标，防止从出生点长距离滑行
+              fighter.x = data.x;
+              fighter.y = data.y;
+              target.targetX = data.x;
+              target.targetY = data.y;
+              target.initialized = true;
+            } else {
+              target.targetX = data.x;
+              target.targetY = data.y;
             }
+            target.vx = data.vx || 0;
+            target.vy = data.vy || 0;
+            target.lastPacketTime = performance.now();
           } else if (data.type === 'sync_enemies') {
             // P2 平滑同步存活敌机列表
             if (roleRef.current === 'p2') {
@@ -812,6 +833,18 @@ export default function RaidenGame() {
     };
     const handleKeyUp = (e: KeyboardEvent) => {
       keysRef.current[e.code] = false;
+      const anyMoveKeyPressed =
+        keysRef.current['ArrowLeft'] ||
+        keysRef.current['KeyA'] ||
+        keysRef.current['ArrowRight'] ||
+        keysRef.current['KeyD'] ||
+        keysRef.current['ArrowUp'] ||
+        keysRef.current['KeyW'] ||
+        keysRef.current['ArrowDown'] ||
+        keysRef.current['KeyS'];
+      if (!anyMoveKeyPressed) {
+        broadcastMyPosition(true);
+      }
     };
 
     window.addEventListener('keydown', handleKeyDown);
@@ -820,7 +853,7 @@ export default function RaidenGame() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, []);
+  }, [broadcastMyPosition]);
 
   // 画布尺寸 Retina 设定
   useEffect(() => {
