@@ -46,6 +46,9 @@ export default function RaidenGame() {
   const p2KillsRef = useRef(0);
   const keysRef = useRef<{ [key: string]: boolean }>({});
   const pingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const httpFallbackActiveRef = useRef(false);
+  const pendingHttpOutgoingRef = useRef<WSMessage[]>([]);
+  const httpTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const p1Ref = useRef<PlayerState>({ x: 120, y: 550, hp: 3, alive: true, color: '#00e5ff', stroke: '#80deea' });
   const p2Ref = useRef<PlayerState>({ x: 255, y: 550, hp: 3, alive: true, color: '#ff9100', stroke: '#ffe082' });
@@ -124,6 +127,8 @@ export default function RaidenGame() {
   const sendMsg = useCallback((obj: WSMessage) => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(obj));
+    } else if (httpFallbackActiveRef.current) {
+      pendingHttpOutgoingRef.current.push(obj);
     }
   }, []);
 
@@ -745,39 +750,268 @@ export default function RaidenGame() {
 
   // 单人训练模式
   const startSoloPractice = () => {
+    if (httpTimerRef.current) {
+      clearInterval(httpTimerRef.current);
+      httpTimerRef.current = null;
+    }
+    httpFallbackActiveRef.current = false;
     setGameMode('practice');
     setRole('p1');
     roleRef.current = 'p1';
     startBattle();
   };
 
-  // 连接 WebSocket
-  const connectServer = () => {
-    const host = serverHost.trim() || (typeof window !== 'undefined' ? window.location.host : 'localhost:3000');
+  // 统一消息调度处理（WebSocket 与 HTTP Fallback 共享同一套逻辑）
+  const handleIncomingMessage = useCallback((data: WSMessage) => {
+    try {
+      if (data.type === 'init') {
+        setRole(data.role);
+        roleRef.current = data.role;
+        setGameMode('online');
+        if (data.roomId) {
+          setRoomId(data.roomId);
+        }
+        if (data.role === 'p1') {
+          setStatusMsg(`房间 ${data.roomId} 创建成功！你是【P1 房主(蓝)】，等待战友加入...`);
+        } else {
+          setStatusMsg(`成功加入房间 ${data.roomId}！你是【P2 僚机(橙)】`);
+        }
+      } else if (data.type === 'start') {
+        setStatusMsg('双人就绪！战机引擎启动...');
+        setIsConnecting(false);
+        setTimeout(startBattle, 800);
+      } else if (data.type === 'pos') {
+        // 工业级状态切片插值 (Time-sliced Snapshot Interpolation) 接收端
+        const isP1 = data.role === 'p1';
+        const peerBuffer = isP1 ? p1BufferRef.current : p2BufferRef.current;
+        const fighter = isP1 ? p1Ref.current : p2Ref.current;
+        const now = performance.now();
+        const newSnap: StateSnapshot = {
+          x: data.x,
+          y: data.y,
+          vx: data.vx || 0,
+          vy: data.vy || 0,
+          t: now,
+        };
+
+        if (!peerBuffer.initialized) {
+          fighter.x = data.x;
+          fighter.y = data.y;
+          peerBuffer.snapshots = [newSnap];
+          peerBuffer.initialized = true;
+          peerBuffer.lastPacketTime = now;
+        } else {
+          const lastSnap = peerBuffer.snapshots[peerBuffer.snapshots.length - 1];
+          if (lastSnap && Math.hypot(data.x - lastSnap.x, data.y - lastSnap.y) > 160) {
+            // 异常位移（如重生），清空快照瞬移对齐
+            fighter.x = data.x;
+            fighter.y = data.y;
+            peerBuffer.snapshots = [newSnap];
+          } else {
+            peerBuffer.snapshots.push(newSnap);
+            if (peerBuffer.snapshots.length > 12) {
+              peerBuffer.snapshots.shift();
+            }
+          }
+          peerBuffer.lastPacketTime = now;
+        }
+      } else if (data.type === 'pong') {
+        if (typeof data.t === 'number') {
+          const measured = Math.max(1, Math.round(performance.now() - data.t));
+          setPing((prev) => (prev === null ? measured : Math.round(prev * 0.6 + measured * 0.4)));
+        }
+      } else if (data.type === 'sync_enemies') {
+        // P2 平滑同步存活敌机列表
+        if (roleRef.current === 'p2') {
+          const currentMap = new Map<string, Enemy>(enemiesRef.current.map((e) => [e.id, e]));
+          const nextList: Enemy[] = [];
+          for (const item of data.list) {
+            const existing = currentMap.get(item.id);
+            if (existing) {
+              existing.x = existing.x * 0.4 + item.x * 0.6;
+              existing.y = Math.max(existing.y, item.y);
+              existing.vy = item.vy;
+              nextList.push(existing);
+            } else {
+              nextList.push({
+                id: item.id,
+                x: item.x,
+                y: item.y,
+                vy: item.vy,
+                w: item.w,
+                h: item.h,
+                color: item.color,
+              });
+            }
+          }
+          enemiesRef.current = nextList;
+        }
+      } else if (data.type === 'kill_enemy' || data.type === 'hit_enemy') {
+        createExplosion(data.ex, data.ey, '#ff5252');
+        const killer = (data.type === 'kill_enemy' && data.killer) || 'p1';
+        addFloatingText(data.ex, data.ey, '+100', killer === 'p1' ? '#00e5ff' : '#ff9100');
+        scoreRef.current = data.score;
+        setScore(data.score);
+
+        if (killer === 'p1') {
+          p1KillsRef.current += 1;
+          setP1Kills(p1KillsRef.current);
+        } else {
+          p2KillsRef.current += 1;
+          setP2Kills(p2KillsRef.current);
+        }
+
+        const targetId = data.id;
+        const idx = enemiesRef.current.findIndex(
+          (e) => (targetId && e.id === targetId) || Math.hypot(e.x - data.ex, e.y - data.ey) < 40
+        );
+        if (idx !== -1) {
+          enemiesRef.current.splice(idx, 1);
+        }
+      } else if (data.type === 'player_hit') {
+        const target = data.target === 'p1' ? p1Ref.current : p2Ref.current;
+        target.hp = data.hp;
+        target.alive = data.alive;
+        createExplosion(target.x, target.y, target.color);
+        if (data.target === 'p1') {
+          setP1Hp(data.hp);
+          setP1Alive(data.alive);
+        } else {
+          setP2Hp(data.hp);
+          setP2Alive(data.alive);
+        }
+        checkGameOverCondition();
+      } else if (data.type === 'peer_leave') {
+        setStatusMsg('队友已退出房间');
+        setInGame(false);
+        gameRunningRef.current = false;
+        if (animIdRef.current) cancelAnimationFrame(animIdRef.current);
+      } else if (data.type === 'error') {
+        setStatusMsg(`提示: ${data.message}`);
+        setIsConnecting(false);
+      }
+    } catch (e) {
+      console.error('Message handling error:', e);
+    }
+  }, [createExplosion, addFloatingText, checkGameOverCondition, startBattle]);
+
+  // HTTP 高速备选通道（在手机浏览器或移动网络拦截 WebSocket 握手时自动无缝兜底）
+  const startHttpSyncFallback = useCallback(async (rId: string) => {
+    httpFallbackActiveRef.current = true;
+    setStatusMsg(`已切换至 HTTP 安全通道连接 (房间 ${rId})...`);
+
+    try {
+      const joinRes = await fetch('/api/room/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: rId }),
+      });
+      const joinData = await joinRes.json();
+      if (joinData.role) {
+        handleIncomingMessage({ type: 'init', role: joinData.role, roomId: rId });
+        if (joinData.gameReady) {
+          handleIncomingMessage({ type: 'start' });
+        }
+      }
+
+      if (httpTimerRef.current) clearInterval(httpTimerRef.current);
+      // 每 50ms 轮询批量上行并同步下行
+      httpTimerRef.current = setInterval(async () => {
+        if (!httpFallbackActiveRef.current) return;
+        const outMessages = [...pendingHttpOutgoingRef.current];
+        pendingHttpOutgoingRef.current.length = 0;
+
+        const startTime = performance.now();
+        try {
+          const syncRes = await fetch('/api/room/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              roomId: rId,
+              role: roleRef.current || 'p1',
+              messages: outMessages,
+            }),
+          });
+          const latency = Math.max(1, Math.round(performance.now() - startTime));
+          setPing((prev) => (prev === null ? latency : Math.round(prev * 0.7 + latency * 0.3)));
+
+          if (syncRes.ok) {
+            const syncData = await syncRes.json();
+            if (Array.isArray(syncData.messages)) {
+              syncData.messages.forEach((msgStr: string) => {
+                try {
+                  const m = JSON.parse(msgStr);
+                  handleIncomingMessage(m);
+                } catch {}
+              });
+            }
+          }
+        } catch (err) {
+          console.warn('HTTP sync error:', err);
+        }
+      }, 50);
+    } catch (err) {
+      console.error('HTTP fallback failed:', err);
+      setStatusMsg('网络连接异常，请检查网络后重试');
+      setIsConnecting(false);
+    }
+  }, [handleIncomingMessage]);
+
+  // 连接服务器（优先 WebSocket，受阻时自动无缝降级为 HTTP 备选通道）
+  const connectServer = async () => {
+    let cleanHost = serverHost.trim() || (typeof window !== 'undefined' ? window.location.host : 'localhost:3000');
+    cleanHost = cleanHost.replace(/^(https?:\/\/|wss?:\/\/)/, '').replace(/\/+$/, '');
     const rId = roomId.trim() || '888';
-    setStatusMsg('正在连接服务器...');
+
+    setStatusMsg('正在验证服务器连接...');
     setIsConnecting(true);
 
     if (wsRef.current) {
       wsRef.current.close();
+      wsRef.current = null;
     }
     if (pingIntervalRef.current) {
       clearInterval(pingIntervalRef.current);
       pingIntervalRef.current = null;
     }
+    if (httpTimerRef.current) {
+      clearInterval(httpTimerRef.current);
+      httpTimerRef.current = null;
+    }
+    httpFallbackActiveRef.current = false;
+    pendingHttpOutgoingRef.current = [];
     setPing(null);
 
-    const wsUrl = (window.location.protocol === 'https:' ? 'wss://' : 'ws://') + host;
+    // 关键点：前置 fetch 激活同源鉴权 Cookie，规避云端 Nginx 302 拦截
+    try {
+      await fetch('/api/health', { credentials: 'include' });
+    } catch (e) {
+      console.warn('Preflight health check note:', e);
+    }
+
+    const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${cleanHost}/ws`;
+
     try {
       const socket = new WebSocket(wsUrl);
       wsRef.current = socket;
 
+      // 若 2 秒内未握手成功，自动降级为 HTTP 备用同步
+      const wsTimeout = setTimeout(() => {
+        if (socket.readyState !== WebSocket.OPEN && !gameRunningRef.current) {
+          console.warn('WebSocket handshake timeout, falling back to HTTP...');
+          try {
+            socket.close();
+          } catch {}
+          startHttpSyncFallback(rId);
+        }
+      }, 2000);
+
       socket.onopen = () => {
+        clearTimeout(wsTimeout);
         setStatusMsg('已建立连接，正在进入房间 ' + rId + '...');
         socket.send(JSON.stringify({ type: 'join', roomId: rId }));
-        // 连通立即首测一次延迟
         socket.send(JSON.stringify({ type: 'ping', t: performance.now() }));
-        // 开启 1.5 秒心跳实时测速
         pingIntervalRef.current = setInterval(() => {
           if (socket.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({ type: 'ping', t: performance.now() }));
@@ -788,165 +1022,43 @@ export default function RaidenGame() {
       socket.onmessage = (event) => {
         try {
           const data: WSMessage = JSON.parse(event.data);
-          if (data.type === 'init') {
-            setRole(data.role);
-            roleRef.current = data.role;
-            setGameMode('online');
-            if (data.roomId) {
-              setRoomId(data.roomId);
-            }
-            if (data.role === 'p1') {
-              setStatusMsg(`房间 ${data.roomId} 创建成功！你是【P1 房主(蓝)】，等待战友加入...`);
-            } else {
-              setStatusMsg(`成功加入房间 ${data.roomId}！你是【P2 僚机(橙)】`);
-            }
-          } else if (data.type === 'start') {
-            setStatusMsg('双人就绪！战机引擎启动...');
-            setIsConnecting(false);
-            setTimeout(startBattle, 800);
-          } else if (data.type === 'pos') {
-            // 工业级状态切片插值 (Time-sliced Snapshot Interpolation) 接收端
-            const isP1 = data.role === 'p1';
-            const peerBuffer = isP1 ? p1BufferRef.current : p2BufferRef.current;
-            const fighter = isP1 ? p1Ref.current : p2Ref.current;
-            const now = performance.now();
-            const newSnap: StateSnapshot = {
-              x: data.x,
-              y: data.y,
-              vx: data.vx || 0,
-              vy: data.vy || 0,
-              t: now,
-            };
-
-            if (!peerBuffer.initialized) {
-              fighter.x = data.x;
-              fighter.y = data.y;
-              peerBuffer.snapshots = [newSnap];
-              peerBuffer.initialized = true;
-              peerBuffer.lastPacketTime = now;
-            } else {
-              const lastSnap = peerBuffer.snapshots[peerBuffer.snapshots.length - 1];
-              if (lastSnap && Math.hypot(data.x - lastSnap.x, data.y - lastSnap.y) > 160) {
-                // 异常位移（如重生），清空快照瞬移对齐
-                fighter.x = data.x;
-                fighter.y = data.y;
-                peerBuffer.snapshots = [newSnap];
-              } else {
-                peerBuffer.snapshots.push(newSnap);
-                if (peerBuffer.snapshots.length > 12) {
-                  peerBuffer.snapshots.shift();
-                }
-              }
-              peerBuffer.lastPacketTime = now;
-            }
-          } else if (data.type === 'pong') {
-            if (typeof data.t === 'number') {
-              const measured = Math.max(1, Math.round(performance.now() - data.t));
-              // 平滑滤波，避免单次突刺导致数字频繁剧烈跳变
-              setPing((prev) => (prev === null ? measured : Math.round(prev * 0.6 + measured * 0.4)));
-            }
-          } else if (data.type === 'sync_enemies') {
-            // P2 平滑同步存活敌机列表
-            if (roleRef.current === 'p2') {
-              const currentMap = new Map<string, Enemy>(enemiesRef.current.map((e) => [e.id, e]));
-              const nextList: Enemy[] = [];
-              for (const item of data.list) {
-                const existing = currentMap.get(item.id);
-                if (existing) {
-                  existing.x = existing.x * 0.4 + item.x * 0.6;
-                  existing.y = Math.max(existing.y, item.y);
-                  existing.vy = item.vy;
-                  nextList.push(existing);
-                } else {
-                  nextList.push({
-                    id: item.id,
-                    x: item.x,
-                    y: item.y,
-                    vy: item.vy,
-                    w: item.w,
-                    h: item.h,
-                    color: item.color,
-                  });
-                }
-              }
-              enemiesRef.current = nextList;
-            }
-          } else if (data.type === 'kill_enemy' || data.type === 'hit_enemy') {
-            createExplosion(data.ex, data.ey, '#ff5252');
-            const killer = (data.type === 'kill_enemy' && data.killer) || 'p1';
-            addFloatingText(data.ex, data.ey, '+100', killer === 'p1' ? '#00e5ff' : '#ff9100');
-            scoreRef.current = data.score;
-            setScore(data.score);
-
-            if (killer === 'p1') {
-              p1KillsRef.current += 1;
-              setP1Kills(p1KillsRef.current);
-            } else {
-              p2KillsRef.current += 1;
-              setP2Kills(p2KillsRef.current);
-            }
-
-            // 立即从本地移除被击毁的这只敌机
-            const targetId = data.id;
-            const idx = enemiesRef.current.findIndex(
-              (e) => (targetId && e.id === targetId) || Math.hypot(e.x - data.ex, e.y - data.ey) < 40
-            );
-            if (idx !== -1) {
-              enemiesRef.current.splice(idx, 1);
-            }
-          } else if (data.type === 'player_hit') {
-            const target = data.target === 'p1' ? p1Ref.current : p2Ref.current;
-            target.hp = data.hp;
-            target.alive = data.alive;
-            createExplosion(target.x, target.y, target.color);
-            if (data.target === 'p1') {
-              setP1Hp(data.hp);
-              setP1Alive(data.alive);
-            } else {
-              setP2Hp(data.hp);
-              setP2Alive(data.alive);
-            }
-            checkGameOverCondition();
-          } else if (data.type === 'peer_leave') {
-            setStatusMsg('队友已退出房间');
-            setInGame(false);
-            gameRunningRef.current = false;
-            if (animIdRef.current) cancelAnimationFrame(animIdRef.current);
-          } else if (data.type === 'error') {
-            setStatusMsg(`提示: ${data.message}`);
-            setIsConnecting(false);
-          }
+          handleIncomingMessage(data);
         } catch (e) {
           console.error(e);
         }
       };
 
       socket.onerror = () => {
-        setStatusMsg('网络连接中断，请确认服务器正常运行');
-        setIsConnecting(false);
+        clearTimeout(wsTimeout);
         if (pingIntervalRef.current) {
           clearInterval(pingIntervalRef.current);
           pingIntervalRef.current = null;
         }
-        setPing(null);
+        // 如果握手受限，立即切换为 HTTP 备选通道，杜绝直接报错中断
+        if (!gameRunningRef.current) {
+          console.warn('WebSocket handshake failed, switching to HTTP sync...');
+          startHttpSyncFallback(rId);
+        }
       };
 
       socket.onclose = () => {
-        setIsConnecting(false);
+        clearTimeout(wsTimeout);
         if (pingIntervalRef.current) {
           clearInterval(pingIntervalRef.current);
           pingIntervalRef.current = null;
         }
-        setPing(null);
-        if (gameRunningRef.current) {
-          setStatusMsg('连接已断开，请重连');
-          gameRunningRef.current = false;
-          setInGame(false);
+        if (!httpFallbackActiveRef.current) {
+          setPing(null);
+          setIsConnecting(false);
+          if (gameRunningRef.current) {
+            setStatusMsg('连接已断开，请重连');
+            gameRunningRef.current = false;
+            setInGame(false);
+          }
         }
       };
     } catch {
-      setStatusMsg('连接失败，请检查主机地址');
-      setIsConnecting(false);
+      startHttpSyncFallback(rId);
     }
   };
 
@@ -998,6 +1110,11 @@ export default function RaidenGame() {
         clearInterval(pingIntervalRef.current);
         pingIntervalRef.current = null;
       }
+      if (httpTimerRef.current) {
+        clearInterval(httpTimerRef.current);
+        httpTimerRef.current = null;
+      }
+      httpFallbackActiveRef.current = false;
       if (wsRef.current) wsRef.current.close();
     };
   }, []);
