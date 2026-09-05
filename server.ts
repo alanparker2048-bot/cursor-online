@@ -41,6 +41,7 @@ const wss = new WebSocketServer({ noServer: true });
 // 显式挂载 Upgrade 事件，确保兼容 /、/ws 等任何路径且不受中间件冲突
 server.on('upgrade', (request, socket, head) => {
   try {
+    socket.setNoDelay(true); // 禁用 Nagle 算法，消除微小数据包等待缓冲延迟
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit('connection', ws, request);
     });
@@ -51,6 +52,12 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 wss.on('connection', (ws: WebSocket) => {
+  // 确保底层 socket 也开启了 NODELAY
+  const rawSocket = (ws as any)._socket;
+  if (rawSocket && typeof rawSocket.setNoDelay === 'function') {
+    rawSocket.setNoDelay(true);
+  }
+
   let curRoom: string | null = null;
   let curRole: 'p1' | 'p2' | null = null;
   let isAlive = true;
