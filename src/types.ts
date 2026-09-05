@@ -51,7 +51,7 @@ export type WSMessage =
   | { type: 'join'; roomId: string }
   | { type: 'init'; role: Role; roomId: string }
   | { type: 'start' }
-  | { type: 'pos'; role: Role; x: number; y: number }
+  | { type: 'pos'; role: Role; x: number; y: number; vx?: number; vy?: number }
   | { type: 'sync_enemies'; list: Array<{ id: string; x: number; y: number; vy: number; w: number; h: number; color: string }> }
   | { type: 'kill_enemy'; id: string; ex: number; ey: number; killer: Role; score: number }
   | { type: 'hit_enemy'; enemyIndex?: number; id?: string; ex: number; ey: number; score: number }

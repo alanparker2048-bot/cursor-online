@@ -47,6 +47,38 @@ export default function RaidenGame() {
 
   const p1Ref = useRef<PlayerState>({ x: 120, y: 550, hp: 3, alive: true, color: '#00e5ff', stroke: '#80deea' });
   const p2Ref = useRef<PlayerState>({ x: 255, y: 550, hp: 3, alive: true, color: '#ff9100', stroke: '#ffe082' });
+
+  // 方案1：远程战机平滑插值 (LERP) 状态
+  interface PeerInterpolationState {
+    targetX: number;
+    targetY: number;
+    vx: number;
+    vy: number;
+    initialized: boolean;
+    lastPacketTime: number;
+  }
+  const p1TargetRef = useRef<PeerInterpolationState>({
+    targetX: 120,
+    targetY: 550,
+    vx: 0,
+    vy: 0,
+    initialized: false,
+    lastPacketTime: 0,
+  });
+  const p2TargetRef = useRef<PeerInterpolationState>({
+    targetX: 255,
+    targetY: 550,
+    vx: 0,
+    vy: 0,
+    initialized: false,
+    lastPacketTime: 0,
+  });
+
+  // 方案3：网络数据包 30Hz 节流发送 (约 33ms 一次，减少网络拥塞，告别数据包粘连)
+  const lastPosSendTimeRef = useRef(0);
+  const lastSentPosRef = useRef({ x: 0, y: 0 });
+  const pendingPosSendRef = useRef(false);
+
   const bulletsRef = useRef<Bullet[]>([]);
   const enemiesRef = useRef<Enemy[]>([]);
   const particlesRef = useRef<Particle[]>([]);
@@ -94,6 +126,44 @@ export default function RaidenGame() {
       wsRef.current.send(JSON.stringify(obj));
     }
   }, []);
+
+  // 方案3：智能节流发送本地战机位置与瞬时速度
+  const broadcastMyPosition = useCallback(
+    (force = false) => {
+      const currentRole = roleRef.current;
+      if (!currentRole) return;
+      const me = currentRole === 'p2' ? p2Ref.current : p1Ref.current;
+      if (!me.alive) return;
+
+      const now = performance.now();
+      const elapsed = now - lastPosSendTimeRef.current;
+      const dx = me.x - lastSentPosRef.current.x;
+      const dy = me.y - lastSentPosRef.current.y;
+      const moved = Math.hypot(dx, dy) > 0.4;
+
+      if (force || (moved && elapsed >= 33)) {
+        const dtSec = Math.max(0.016, elapsed / 1000);
+        const vx = Math.round((dx / dtSec) * 10) / 10;
+        const vy = Math.round((dy / dtSec) * 10) / 10;
+
+        sendMsg({
+          type: 'pos',
+          role: currentRole,
+          x: Math.round(me.x * 10) / 10,
+          y: Math.round(me.y * 10) / 10,
+          vx: force ? 0 : vx,
+          vy: force ? 0 : vy,
+        });
+
+        lastPosSendTimeRef.current = now;
+        lastSentPosRef.current = { x: me.x, y: me.y };
+        pendingPosSendRef.current = false;
+      } else if (moved) {
+        pendingPosSendRef.current = true;
+      }
+    },
+    [sendMsg]
+  );
 
   // 背景星空初始化
   const initStars = useCallback(() => {
