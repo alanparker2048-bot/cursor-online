@@ -274,9 +274,42 @@ export default function RaidenGame() {
         if (dx !== 0 || dy !== 0) {
           me.x = Math.max(16, Math.min(V_W - 16, me.x + dx));
           me.y = Math.max(20, Math.min(V_H - 20, me.y + dy));
-          if (currentRole) {
-            sendMsg({ type: 'pos', role: currentRole, x: me.x, y: me.y });
-          }
+          broadcastMyPosition(false);
+        }
+      }
+
+      // 方案3：处理待发送的 30Hz 限流位置数据包
+      if (pendingPosSendRef.current && performance.now() - lastPosSendTimeRef.current >= 33) {
+        broadcastMyPosition(false);
+      }
+
+      // 方案1：对方战机平滑插值 (LERP) 更新，彻底消除网络抖动闪现与画面僵死停顿
+      const peerRole: Role = currentRole === 'p2' ? 'p1' : 'p2';
+      const peer = peerRole === 'p1' ? p1 : p2;
+      const peerTarget = peerRole === 'p1' ? p1TargetRef.current : p2TargetRef.current;
+
+      if (gameMode === 'online' && peerTarget.initialized && peer.alive) {
+        // 微量航位推测：如果对方正处于运动中，在两包到达间隔进行短时微推（上限 80ms，杜绝过冲）
+        const timeSincePacket = performance.now() - peerTarget.lastPacketTime;
+        let targetX = peerTarget.targetX;
+        let targetY = peerTarget.targetY;
+        if (timeSincePacket < 80 && (peerTarget.vx !== 0 || peerTarget.vy !== 0)) {
+          targetX += (peerTarget.vx * (dt / 1000));
+          targetY += (peerTarget.vy * (dt / 1000));
+          targetX = Math.max(16, Math.min(V_W - 16, targetX));
+          targetY = Math.max(20, Math.min(V_H - 20, targetY));
+        }
+
+        const dist = Math.hypot(targetX - peer.x, targetY - peer.y);
+        if (dist > 160) {
+          // 距离过大（如开局或复活重置），直接对齐
+          peer.x = targetX;
+          peer.y = targetY;
+        } else if (dist > 0.1) {
+          // 指数平滑衰减插值 (LERP)：帧率自适应，每 16ms 趋近约 30%，相当于超平滑的视觉过渡
+          const lerpFactor = 1 - Math.exp(-22 * (dt / 1000));
+          peer.x += (targetX - peer.x) * lerpFactor;
+          peer.y += (targetY - peer.y) * lerpFactor;
         }
       }
 
@@ -639,7 +672,8 @@ export default function RaidenGame() {
     p1TargetRef.current = { targetX: 120, targetY: 550, vx: 0, vy: 0, initialized: false, lastPacketTime: 0 };
     p2TargetRef.current = { targetX: 255, targetY: 550, vx: 0, vy: 0, initialized: false, lastPacketTime: 0 };
     lastPosSendTimeRef.current = 0;
-    lastSentPosRef.current = { x: 0, y: 0 };
+    const curRole = roleRef.current;
+    lastSentPosRef.current = { x: curRole === 'p2' ? 255 : 120, y: 550 };
     pendingPosSendRef.current = false;
 
     setP1Hp(3);
